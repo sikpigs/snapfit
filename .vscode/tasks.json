@@ -1,0 +1,49 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: configure debug",
+            "type": "cmake",
+            "command": "configure",
+            "preset": "debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build debug",
+            "type": "cmake",
+            "command": "build",
+            "preset": "debug",
+            "targets": [
+                "snapfit"
+            ],
+            "dependsOn": "CMake: configure debug",
+            "dependsOrder": "sequence",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "CMake: run debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/build/debug/snapfit",
+            "dependsOn": "CMake: build debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build release",
+            "type": "cmake",
+            "command": "build",
+            "preset": "release",
+            "targets": [
+                "snapfit"
+            ],
+            "problemMatcher": [
+                "$gcc"
+            ]
+        }
+    ]
+}
