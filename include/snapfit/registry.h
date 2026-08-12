@@ -5,7 +5,6 @@
 #include <cassert>
 #include <cstddef>
 #include <exception>
-#include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -608,93 +607,6 @@ namespace snapfit
             set_free(ent);
         }
 
-        /// Invokes `cb` for every live entity that owns all requested components.
-        template<typename... Components, typename Callback>
-            requires(
-                !contains_tag_type<Components...>
-                && std::invocable<Callback&, const entity&, std::remove_cvref_t<Components>&...>)
-        void view(Callback&& cb) noexcept(
-            std::is_nothrow_invocable_v<Callback&,
-                                        const entity&,
-                                        std::remove_cvref_t<Components>&...>)
-        {
-            view<Components...>(include<>, exclude<>, std::forward<Callback>(cb));
-        }
-
-        /// Invokes `cb` for every live entity that owns all requested components.
-        template<typename... Components, typename... Excluded, typename Callback>
-            requires(
-                !contains_tag_type<Components...>
-                && std::invocable<Callback&, const entity&, std::remove_cvref_t<Components>&...>)
-        void view(exclude_t<Excluded...>, Callback&& cb) noexcept(
-            std::is_nothrow_invocable_v<Callback&,
-                                        const entity&,
-                                        std::remove_cvref_t<Components>&...>)
-        {
-            view<Components...>(include<>, exclude<Excluded...>, std::forward<Callback>(cb));
-        }
-
-        template<typename... Components,
-                 typename... Included,
-                 typename... Excluded,
-                 typename Callback>
-            requires(
-                !contains_tag_type<Components...>
-                && std::invocable<Callback&, const entity&, std::remove_cvref_t<Components>&...>)
-        void view(include_t<Included...>, exclude_t<Excluded...>, Callback&& cb) noexcept(
-            std::is_nothrow_invocable_v<Callback&,
-                                        const entity&,
-                                        std::remove_cvref_t<Components>&...>)
-        {
-            view_impl(
-                *this, type_list<Components...>, include<Included...>, exclude<Excluded...>, cb);
-        }
-
-        /// Invokes `cb` for every live entity that owns all requested components.
-        template<typename... Components, typename Callback>
-            requires(!contains_tag_type<Components...>
-                     && std::invocable<Callback&,
-                                       const entity&,
-                                       const std::remove_cvref_t<Components>&...>)
-        void view(Callback&& cb) const
-            noexcept(std::is_nothrow_invocable_v<Callback&,
-                                                 const entity&,
-                                                 const std::remove_cvref_t<Components>&...>)
-        {
-            view<Components...>(include<>, exclude<>, std::forward<Callback>(cb));
-        }
-
-        /// Invokes `cb` for every matching entity that owns no excluded component.
-        template<typename... Components, typename... Excluded, typename Callback>
-            requires(!contains_tag_type<Components...>
-                     && std::invocable<Callback&,
-                                       const entity&,
-                                       const std::remove_cvref_t<Components>&...>)
-        void view(exclude_t<Excluded...>, Callback&& cb) const
-            noexcept(std::is_nothrow_invocable_v<Callback&,
-                                                 const entity&,
-                                                 const std::remove_cvref_t<Components>&...>)
-        {
-            view<Components...>(include<>, exclude<Excluded...>, std::forward<Callback>(cb));
-        }
-
-        template<typename... Components,
-                 typename... Included,
-                 typename... Excluded,
-                 typename Callback>
-            requires(!contains_tag_type<Components...>
-                     && std::invocable<Callback&,
-                                       const entity&,
-                                       const std::remove_cvref_t<Components>&...>)
-        void view(include_t<Included...>, exclude_t<Excluded...>, Callback&& cb) const
-            noexcept(std::is_nothrow_invocable_v<Callback&,
-                                                 const entity&,
-                                                 const std::remove_cvref_t<Components>&...>)
-        {
-            view_impl(
-                *this, type_list<Components...>, include<Included...>, exclude<Excluded...>, cb);
-        }
-
         template<typename... Components, typename... Included, typename... Excluded>
             requires(!contains_tag_type<Components...>)
         auto view(include_t<Included...>, exclude_t<Excluded...>)
@@ -873,87 +785,6 @@ namespace snapfit
             using component_no_cvref = std::remove_cvref_t<Component>;
             const auto* pool = find_storage<component_no_cvref>();
             return pool && pool->contains(ent);
-        }
-
-        template<typename Self, typename Component>
-        using view_component_ref_t = std::conditional_t<std::is_const_v<Self>,
-                                                        const std::remove_cvref_t<Component>&,
-                                                        std::remove_cvref_t<Component>&>;
-
-        template<typename Self,
-                 typename... Components,
-                 typename... Included,
-                 typename... Excluded,
-                 typename Callback>
-        static void view_impl(
-            Self& self,
-            type_list_t<Components...>,
-            include_t<Included...>,
-            exclude_t<Excluded...>,
-            Callback&&
-                cb) noexcept(std::is_nothrow_invocable_v<Callback&,
-                                                         const entity&,
-                                                         view_component_ref_t<Self, Components>...>)
-        {
-            auto component_pools =
-                std::tuple { self.template find_storage<std::remove_cvref_t<Components>>()... };
-
-            std::array<const storage_base<entity>*, sizeof...(Included)> included_pools {
-                self.template find_storage<std::remove_cvref_t<Included>>()...
-            };
-
-            std::array<const storage_base<entity>*, sizeof...(Excluded)> excluded_pools {
-                self.template find_storage<std::remove_cvref_t<Excluded>>()...
-            };
-
-            const auto visit = [&](const entity ent)
-            {
-                const auto has_components =
-                    std::apply([&](const auto*... pools) { return (pools->contains(ent) && ...); },
-                               component_pools);
-                const auto has_includes = std::ranges::all_of(
-                    included_pools, [&](const auto* pool) { return pool->contains(ent); });
-                const auto is_excluded = std::ranges::any_of(
-                    excluded_pools, [&](const auto* pool) { return pool && pool->contains(ent); });
-
-                if (!has_components || !has_includes || is_excluded)
-                {
-                    return;
-                }
-
-                std::apply([&](auto*... pools) { std::invoke(cb, ent, pools->get(ent)...); },
-                           component_pools);
-            };
-
-            if constexpr (sizeof...(Components) + sizeof...(Included) == 0)
-            {
-                for (std::size_t index = 0; index < self.entities.size(); ++index)
-                {
-                    const auto ent = self.entities[index];
-                    if (details::entity_index<Traits>(ent) == index)
-                    {
-                        visit(ent);
-                    }
-                }
-            }
-            else
-            {
-                auto pools = self.template pools_with<std::remove_cvref_t<Components>...,
-                                                      std::remove_cvref_t<Included>...>();
-
-                if (!pools)
-                {
-                    return;
-                }
-
-                const auto smallest = std::ranges::min_element(
-                    *pools, {}, [](const auto* pool) { return pool->size(); });
-
-                for (const auto ent : (*smallest)->entities())
-                {
-                    visit(ent);
-                }
-            }
         }
 
         template<typename Self, typename... Components, typename... Included, typename... Excluded>
