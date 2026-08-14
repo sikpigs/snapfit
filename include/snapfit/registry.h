@@ -608,7 +608,8 @@ namespace snapfit
         }
 
         template<typename... Components, typename... Included, typename... Excluded>
-            requires(!contains_tag_type<Components...>)
+            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
+                     && !type_list_t<Components...>::volatile_types())
         auto view(include_t<Included...>, exclude_t<Excluded...>)
         {
             return view_impl(
@@ -616,21 +617,24 @@ namespace snapfit
         }
 
         template<typename... Components, typename... Excluded>
-            requires(!contains_tag_type<Components...>)
+            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
+                     && !type_list_t<Components...>::volatile_types())
         auto view(exclude_t<Excluded...>)
         {
             return view_impl(*this, type_list<Components...>, include<>, exclude<Excluded...>);
         }
 
         template<typename... Components>
-            requires(!contains_tag_type<Components...>)
+            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
+                     && !type_list_t<Components...>::volatile_types())
         auto view()
         {
             return view_impl(*this, type_list<Components...>, include<>, exclude<>);
         }
 
         template<typename... Components, typename... Included, typename... Excluded>
-            requires(!contains_tag_type<Components...>)
+            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
+                     && !type_list_t<Components...>::volatile_types())
         auto view(include_t<Included...>, exclude_t<Excluded...>) const
         {
             return view_impl(
@@ -638,14 +642,16 @@ namespace snapfit
         }
 
         template<typename... Components, typename... Excluded>
-            requires(!contains_tag_type<Components...>)
+            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
+                     && !type_list_t<Components...>::volatile_types())
         auto view(exclude_t<Excluded...>) const
         {
             return view_impl(*this, type_list<Components...>, include<>, exclude<Excluded...>);
         }
 
         template<typename... Components>
-            requires(!contains_tag_type<Components...>)
+            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
+                     && !type_list_t<Components...>::volatile_types())
         auto view() const
         {
             return view_impl(*this, type_list<Components...>, include<>, exclude<>);
@@ -787,15 +793,31 @@ namespace snapfit
             return pool && pool->contains(ent);
         }
 
+        template<typename Component, typename Self>
+        static auto view_storage(Self& self) noexcept
+        {
+            using component_type = std::remove_cvref_t<Component>;
+            constexpr bool is_const =
+                std::is_const_v<Self> || std::is_const_v<std::remove_reference_t<Component>>;
+
+            if constexpr (is_const)
+            {
+                return static_cast<const storage<component_type, Traits>*>(
+                    self.template find_storage<component_type>());
+            }
+            else
+            {
+                return self.template find_storage<component_type>();
+            }
+        }
+
         template<typename Self, typename... Components, typename... Included, typename... Excluded>
-            requires(!contains_tag_type<Components...>)
         static auto view_impl(Self& self,
                               type_list_t<Components...>,
                               include_t<Included...>,
                               exclude_t<Excluded...>)
         {
-            auto component_pools =
-                std::tuple { self.template find_storage<std::remove_cvref_t<Components>>()... };
+            auto component_pools = std::tuple { view_storage<Components>(self)... };
 
             std::array<const storage_base<entity>*, sizeof...(Included)> included_pools {
                 self.template find_storage<std::remove_cvref_t<Included>>()...

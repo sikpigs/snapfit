@@ -403,6 +403,80 @@ TEST_CASE("range view yields requested components by mutable reference")
     CHECK(value.get<position>(missing_velocity).x == 10);
 }
 
+TEST_CASE("range view supports mixed mutable and const component access")
+{
+    registry value;
+
+    const auto matching = value.create();
+    value.emplace<position>(matching, 3);
+    value.emplace<velocity>(matching, 4);
+
+    auto matching_view = value.view<velocity, const position>();
+    using reference = std::ranges::range_reference_t<decltype(matching_view)>;
+    static_assert(std::same_as<reference,
+                               std::tuple<entity, velocity&, const position&>>);
+
+    std::size_t visits = 0;
+    for (auto [ent, vel, pos] : matching_view)
+    {
+        CHECK(ent == matching);
+        vel.x += pos.x;
+        ++visits;
+    }
+
+    CHECK(visits == 1);
+    CHECK(value.get<velocity>(matching).x == 7);
+    CHECK(value.get<position>(matching).x == 3);
+}
+
+TEST_CASE("range view can request only const components from a mutable registry")
+{
+    registry value;
+
+    const auto matching = value.create();
+    value.emplace<position>(matching, 1);
+    value.emplace<velocity>(matching, 2);
+
+    auto matching_view = value.view<const position, const velocity>();
+    using reference = std::ranges::range_reference_t<decltype(matching_view)>;
+    static_assert(std::same_as<reference,
+                               std::tuple<entity, const position&, const velocity&>>);
+
+    auto [ent, pos, vel] = *matching_view.begin();
+    CHECK(ent == matching);
+    CHECK(pos.x == 1);
+    CHECK(vel.x == 2);
+}
+
+TEST_CASE("const range view makes every requested component const")
+{
+    registry value;
+
+    const auto matching = value.create();
+    value.emplace<position>(matching, 1);
+    value.emplace<velocity>(matching, 2);
+
+    const registry& const_value = value;
+    auto matching_view = const_value.view<velocity, const position>();
+    using reference = std::ranges::range_reference_t<decltype(matching_view)>;
+    static_assert(std::same_as<reference,
+                               std::tuple<entity, const velocity&, const position&>>);
+}
+
+TEST_CASE("view component type list identifies duplicate and volatile requests")
+{
+    static_assert(snapfit::type_list_t<>::unique());
+    static_assert(snapfit::type_list_t<position>::unique());
+    static_assert(snapfit::type_list_t<const position>::unique());
+    static_assert(!snapfit::type_list_t<position, position>::unique());
+    static_assert(!snapfit::type_list_t<const position, const position>::unique());
+
+    static_assert(!snapfit::type_list_t<>::volatile_types());
+    static_assert(!snapfit::type_list_t<position, const velocity>::volatile_types());
+    static_assert(snapfit::type_list_t<volatile position>::volatile_types());
+    static_assert(snapfit::type_list_t<const volatile position>::volatile_types());
+}
+
 TEST_CASE("range view applies included and excluded filters")
 {
     registry value;
