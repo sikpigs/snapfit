@@ -46,6 +46,28 @@ namespace
         value.template try_get<Component>(ent);
     };
 
+    template<typename Registry>
+    concept duplicate_required_viewable =
+        requires(Registry& value) { value.template view<position, const position>(); };
+
+    template<typename Registry>
+    concept duplicate_optional_viewable = requires(Registry& value) {
+        value.template view<>(snapfit::optional<velocity, const velocity>);
+    };
+
+    template<typename Registry>
+    concept required_optional_overlap_viewable = requires(Registry& value) {
+        value.template view<position>(snapfit::optional<const position>);
+    };
+
+    template<typename Registry>
+    concept volatile_optional_viewable =
+        requires(Registry& value) { value.template view<>(snapfit::optional<volatile velocity>); };
+
+    template<typename Registry>
+    concept tag_optional_viewable =
+        requires(Registry& value) { value.template view<>(snapfit::optional<selected>); };
+
     enum class tiny_entity : std::uint32_t
     {
     };
@@ -413,8 +435,7 @@ TEST_CASE("range view supports mixed mutable and const component access")
 
     auto matching_view = value.view<velocity, const position>();
     using reference = std::ranges::range_reference_t<decltype(matching_view)>;
-    static_assert(std::same_as<reference,
-                               std::tuple<entity, velocity&, const position&>>);
+    static_assert(std::same_as<reference, std::tuple<entity, velocity&, const position&>>);
 
     std::size_t visits = 0;
     for (auto [ent, vel, pos] : matching_view)
@@ -439,8 +460,7 @@ TEST_CASE("range view can request only const components from a mutable registry"
 
     auto matching_view = value.view<const position, const velocity>();
     using reference = std::ranges::range_reference_t<decltype(matching_view)>;
-    static_assert(std::same_as<reference,
-                               std::tuple<entity, const position&, const velocity&>>);
+    static_assert(std::same_as<reference, std::tuple<entity, const position&, const velocity&>>);
 
     auto [ent, pos, vel] = *matching_view.begin();
     CHECK(ent == matching);
@@ -459,22 +479,16 @@ TEST_CASE("const range view makes every requested component const")
     const registry& const_value = value;
     auto matching_view = const_value.view<velocity, const position>();
     using reference = std::ranges::range_reference_t<decltype(matching_view)>;
-    static_assert(std::same_as<reference,
-                               std::tuple<entity, const velocity&, const position&>>);
+    static_assert(std::same_as<reference, std::tuple<entity, const velocity&, const position&>>);
 }
 
-TEST_CASE("view component type list identifies duplicate and volatile requests")
+TEST_CASE("view component type list identifies duplicate requests")
 {
     static_assert(snapfit::type_list_t<>::unique());
     static_assert(snapfit::type_list_t<position>::unique());
     static_assert(snapfit::type_list_t<const position>::unique());
     static_assert(!snapfit::type_list_t<position, position>::unique());
     static_assert(!snapfit::type_list_t<const position, const position>::unique());
-
-    static_assert(!snapfit::type_list_t<>::volatile_types());
-    static_assert(!snapfit::type_list_t<position, const velocity>::volatile_types());
-    static_assert(snapfit::type_list_t<volatile position>::volatile_types());
-    static_assert(snapfit::type_list_t<const volatile position>::volatile_types());
 }
 
 TEST_CASE("range view applies included and excluded filters")
@@ -554,4 +568,139 @@ TEST_CASE("range view is empty when a required storage is missing")
     const auto missing_storage_view = value.view<position, velocity>();
 
     CHECK(missing_storage_view.begin() == missing_storage_view.end());
+}
+
+TEST_CASE("range view yields mutable and const optional component pointers")
+{
+    registry value;
+    const auto first = value.create();
+    value.emplace<position>(first, 1);
+    const auto second = value.create();
+    value.emplace<position>(second, 2);
+    value.emplace<velocity>(second, 3);
+
+    auto mutable_view = value.view<position>(snapfit::optional<velocity>);
+    using mutable_reference = std::ranges::range_reference_t<decltype(mutable_view)>;
+    static_assert(std::same_as<mutable_reference, std::tuple<entity, position&, velocity*>>);
+    static_assert(std::ranges::input_range<decltype(mutable_view)>);
+
+    for (auto [ent, pos, vel] : mutable_view)
+    {
+        if (vel)
+        {
+            vel->x += pos.x;
+        }
+    }
+
+    CHECK(value.get<velocity>(second).x == 5);
+
+    auto const_component_view = value.view<position>(snapfit::optional<const velocity>);
+    using const_component_reference =
+        std::ranges::range_reference_t<decltype(const_component_view)>;
+    static_assert(
+        std::same_as<const_component_reference, std::tuple<entity, position&, const velocity*>>);
+
+    const registry& const_value = value;
+    auto const_registry_view = const_value.view<position>(snapfit::optional<velocity>);
+    using const_registry_reference = std::ranges::range_reference_t<decltype(const_registry_view)>;
+    static_assert(std::same_as<const_registry_reference,
+                               std::tuple<entity, const position&, const velocity*>>);
+}
+
+TEST_CASE("range view tolerates missing optional component storage")
+{
+    registry value;
+    const auto ent = value.create();
+    value.emplace<position>(ent, 4);
+
+    auto positions = value.view<position>(snapfit::optional<velocity>);
+    std::size_t visits = 0;
+    for (auto [found, pos, vel] : positions)
+    {
+        CHECK(found == ent);
+        CHECK(pos.x == 4);
+        CHECK(vel == nullptr);
+        ++visits;
+    }
+
+    CHECK(visits == 1);
+}
+
+TEST_CASE("range view with only optional components yields every live entity")
+{
+    registry value;
+    const auto first = value.create();
+    const auto released = value.create();
+    const auto last = value.create();
+    value.emplace<velocity>(last, 7);
+    value.release(released);
+
+    std::size_t visits = 0;
+    for (auto [ent, vel] : value.view<>(snapfit::optional<velocity>))
+    {
+        CHECK((ent == first || ent == last));
+        CHECK((vel == nullptr || (ent == last && vel->x == 7)));
+        ++visits;
+    }
+
+    CHECK(visits == 2);
+}
+
+TEST_CASE("range view combines optional components with filters")
+{
+    registry value;
+
+    const auto matching = value.create();
+    value.emplace<position>(matching, 1);
+    value.emplace<velocity>(matching, 2);
+    value.emplace<selected>(matching);
+
+    const auto missing_include = value.create();
+    value.emplace<position>(missing_include, 3);
+
+    const auto excluded = value.create();
+    value.emplace<position>(excluded, 4);
+    value.emplace<selected>(excluded);
+    value.emplace<disabled>(excluded);
+
+    auto filtered = value.view<position>(
+        snapfit::include<selected>, snapfit::exclude<disabled>, snapfit::optional<velocity>);
+    auto iter = filtered.begin();
+    auto [ent, pos, vel] = *iter;
+    CHECK(ent == matching);
+    CHECK(pos.x == 1);
+    REQUIRE(vel != nullptr);
+    CHECK(vel->x == 2);
+    CHECK(++iter == filtered.end());
+
+    std::size_t unselected_visits = 0;
+    for (auto [found, found_pos, found_vel] :
+         value.view<position>(snapfit::exclude<selected>, snapfit::optional<velocity>))
+    {
+        CHECK(found == missing_include);
+        CHECK(found_pos.x == 3);
+        CHECK(found_vel == nullptr);
+        ++unselected_visits;
+    }
+    CHECK(unselected_visits == 1);
+
+    const registry& const_value = value;
+    auto const_filtered = const_value.view<position>(
+        snapfit::include<selected>, snapfit::exclude<disabled>, snapfit::optional<velocity>);
+    using const_filtered_reference = std::ranges::range_reference_t<decltype(const_filtered)>;
+    static_assert(std::same_as<const_filtered_reference,
+                               std::tuple<entity, const position&, const velocity*>>);
+
+    auto const_excluded =
+        const_value.view<position>(snapfit::exclude<selected>, snapfit::optional<velocity>);
+    static_assert(std::ranges::input_range<decltype(const_excluded)>);
+}
+
+TEST_CASE("range view rejects invalid required and optional component lists")
+{
+    static_assert(!duplicate_required_viewable<registry>);
+    static_assert(!duplicate_optional_viewable<registry>);
+    static_assert(!required_optional_overlap_viewable<registry>);
+    static_assert(!volatile_optional_viewable<registry>);
+    static_assert(!tag_optional_viewable<registry>);
 }

@@ -5,3 +5,4 @@
 #include <snapfit/query.h>
 #include <snapfit/registry.h>
 #include <snapfit/storage.h>
+#include <snapfit/view.h>

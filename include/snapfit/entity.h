@@ -107,7 +107,8 @@ namespace snapfit
     class no_such_component : public std::runtime_error
     {
     public:
-        no_such_component() : std::runtime_error { "no such component" }
+        no_such_component()
+            : std::runtime_error { "no such component" }
         {
         }
     };
@@ -116,7 +117,8 @@ namespace snapfit
     class duplicate_component : public std::runtime_error
     {
     public:
-        duplicate_component() : std::runtime_error { "component already exists" }
+        duplicate_component()
+            : std::runtime_error { "component already exists" }
         {
         }
     };
@@ -125,7 +127,8 @@ namespace snapfit
     class invalid_entity : public std::runtime_error
     {
     public:
-        invalid_entity() : std::runtime_error { "invalid entity" }
+        invalid_entity()
+            : std::runtime_error { "invalid entity" }
         {
         }
     };

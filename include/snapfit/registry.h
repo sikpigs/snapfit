@@ -5,11 +5,9 @@
 #include <cassert>
 #include <cstddef>
 #include <exception>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <ranges>
-#include <span>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
@@ -19,180 +17,10 @@
 #include <snapfit/entity.h>
 #include <snapfit/query.h>
 #include <snapfit/storage.h>
+#include <snapfit/view.h>
 
 namespace snapfit
 {
-    template<typename Pool>
-    using pool_type = std::remove_pointer_t<Pool>;
-
-    template<typename Pool>
-    using pool_component_type = typename std::remove_const_t<pool_type<Pool>>::component_type;
-
-    template<typename Pool>
-    using pool_component_reference = std::conditional_t<std::is_const_v<pool_type<Pool>>,
-                                                        const pool_component_type<Pool>&,
-                                                        pool_component_type<Pool>&>;
-
-    template<typename Entity, typename PoolTuple>
-    struct iterator_types;
-
-    template<typename Entity, typename... Pools>
-    struct iterator_types<Entity, std::tuple<Pools...>> {
-        using value_type = std::tuple<Entity, pool_component_type<Pools>...>;
-        using reference = std::tuple<Entity, pool_component_reference<Pools>...>;
-    };
-
-    template<traits_type Traits,
-             typename ComponentPools,
-             std::size_t IncludedCount,
-             std::size_t ExcludedCount>
-    class basic_view : public std::ranges::view_interface<
-                           basic_view<Traits, ComponentPools, IncludedCount, ExcludedCount>>
-    {
-    public:
-        using entity = Traits::entity;
-
-        class iterator
-        {
-        public:
-            using difference_type = std::ptrdiff_t;
-            using iterator_concept = std::input_iterator_tag;
-            using iterator_category = std::input_iterator_tag;
-            using types = iterator_types<entity, ComponentPools>;
-            using value_type = typename types::value_type;
-            using reference = typename types::reference;
-
-            iterator() = default;
-
-            iterator(const basic_view* owning_view, std::size_t start_index)
-                : owner { owning_view }
-                , index { start_index }
-            {
-                satisfy();
-            }
-
-            reference operator*() const
-            {
-                assert(owner != nullptr);
-                assert(index < owner->candidates.size());
-
-                const auto ent = owner->candidates[index];
-                return std::apply(
-                    [&](auto*... pools) -> reference {
-                        return std::tuple<entity, decltype(pools->get(ent))...> {
-                            ent, pools->get(ent)...
-                        };
-                    },
-                    owner->component_pools);
-            }
-
-            iterator& operator++()
-            {
-                ++index;
-                satisfy();
-                return *this;
-            }
-
-            iterator operator++(int)
-            {
-                auto prev = *this;
-                ++*this;
-                return prev;
-            }
-
-            friend bool operator==(const iterator&, const iterator&) = default;
-
-        private:
-            void satisfy()
-            {
-                while (index < owner->candidates.size())
-                {
-                    const auto ent = owner->candidates[index];
-
-                    if (owner->check_liveness)
-                    {
-                        if (details::entity_index<Traits>(ent) != index)
-                        {
-                            ++index;
-                            continue;
-                        }
-                    }
-
-                    const bool has_components =
-                        std::apply([&](const auto*... pools)
-                                   { return ((pools && pools->contains(ent)) && ...); },
-                                   owner->component_pools);
-                    if (!has_components)
-                    {
-                        ++index;
-                        continue;
-                    }
-
-                    const bool has_includes = std::ranges::all_of(
-                        owner->included_pools,
-                        [&](const auto* pool) { return pool && pool->contains(ent); });
-
-                    if (!has_includes)
-                    {
-                        ++index;
-                        continue;
-                    }
-
-                    const bool is_excluded = std::ranges::any_of(
-                        owner->excluded_pools,
-                        [&](const auto* pool) { return pool && pool->contains(ent); });
-
-                    if (is_excluded)
-                    {
-                        ++index;
-                        continue;
-                    }
-
-                    break;
-                }
-            }
-
-            const basic_view* owner = nullptr;
-            std::size_t index = 0;
-        };
-
-        using included_pools_t = std::array<const storage_base<entity>*, IncludedCount>;
-        using excluded_pools_t = std::array<const storage_base<entity>*, ExcludedCount>;
-        using candidates_t = std::span<const entity>;
-
-        basic_view() = default;
-
-        basic_view(ComponentPools&& component_pools_in,
-                   included_pools_t&& included_pools_in,
-                   excluded_pools_t&& excluded_pools_in,
-                   candidates_t candidates_in,
-                   bool check_liveness_in)
-            : component_pools { std::forward<ComponentPools>(component_pools_in) }
-            , included_pools { std::forward<included_pools_t>(included_pools_in) }
-            , excluded_pools { std::forward<excluded_pools_t>(excluded_pools_in) }
-            , candidates { candidates_in }
-            , check_liveness { check_liveness_in }
-        {
-        }
-
-        iterator begin() const
-        {
-            return iterator { this, 0 };
-        }
-
-        iterator end() const
-        {
-            return iterator { this, candidates.size() };
-        }
-
-    private:
-        ComponentPools component_pools {};
-        included_pools_t included_pools {};
-        excluded_pools_t excluded_pools {};
-        candidates_t candidates {};
-        bool check_liveness { false };
-    };
-
     /// Owns entity lifetimes and their type-erased component storages.
     ///
     /// Entity handles contain an index and generation. Releasing an entity
@@ -607,54 +435,142 @@ namespace snapfit
             set_free(ent);
         }
 
+        /// Returns a view yielding `Components...` for entities that satisfy the given filters.
+        /// Included types must be present and excluded types must be absent; filter components are
+        /// not returned. A mutable registry yields mutable references unless a component is const.
         template<typename... Components, typename... Included, typename... Excluded>
-            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
-                     && !type_list_t<Components...>::volatile_types())
+            requires view_component_types<Components...>
         auto view(include_t<Included...>, exclude_t<Excluded...>)
         {
-            return view_impl(
-                *this, type_list<Components...>, include<Included...>, exclude<Excluded...>);
+            return view_impl(*this,
+                             type_list<Components...>,
+                             include<Included...>,
+                             exclude<Excluded...>,
+                             optional<>);
         }
 
+        /// Returns a view yielding `Components...` while rejecting excluded component types.
         template<typename... Components, typename... Excluded>
-            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
-                     && !type_list_t<Components...>::volatile_types())
+            requires view_component_types<Components...>
         auto view(exclude_t<Excluded...>)
         {
-            return view_impl(*this, type_list<Components...>, include<>, exclude<Excluded...>);
+            return view_impl(
+                *this, type_list<Components...>, include<>, exclude<Excluded...>, optional<>);
         }
 
+        /// Returns a view yielding `Components...` for entities that own every requested type.
+        /// An empty component list visits every live entity.
         template<typename... Components>
-            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
-                     && !type_list_t<Components...>::volatile_types())
+            requires view_component_types<Components...>
         auto view()
         {
-            return view_impl(*this, type_list<Components...>, include<>, exclude<>);
+            return view_impl(*this, type_list<Components...>, include<>, exclude<>, optional<>);
         }
 
+        /// Returns a const view yielding `Components...` for entities satisfying the filters.
+        /// Every returned component reference is const regardless of the requested
+        /// cv-qualification.
         template<typename... Components, typename... Included, typename... Excluded>
-            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
-                     && !type_list_t<Components...>::volatile_types())
+            requires view_component_types<Components...>
         auto view(include_t<Included...>, exclude_t<Excluded...>) const
         {
-            return view_impl(
-                *this, type_list<Components...>, include<Included...>, exclude<Excluded...>);
+            return view_impl(*this,
+                             type_list<Components...>,
+                             include<Included...>,
+                             exclude<Excluded...>,
+                             optional<>);
         }
 
+        /// Returns a const view yielding components while rejecting excluded component types.
         template<typename... Components, typename... Excluded>
-            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
-                     && !type_list_t<Components...>::volatile_types())
+            requires view_component_types<Components...>
         auto view(exclude_t<Excluded...>) const
         {
-            return view_impl(*this, type_list<Components...>, include<>, exclude<Excluded...>);
+            return view_impl(
+                *this, type_list<Components...>, include<>, exclude<Excluded...>, optional<>);
         }
 
+        /// Returns a const view for entities that own every requested component type.
+        /// An empty component list visits every live entity.
         template<typename... Components>
-            requires(!contains_tag_type<Components...> && type_list_t<Components...>::unique()
-                     && !type_list_t<Components...>::volatile_types())
+            requires view_component_types<Components...>
         auto view() const
         {
-            return view_impl(*this, type_list<Components...>, include<>, exclude<>);
+            return view_impl(*this, type_list<Components...>, include<>, exclude<>, optional<>);
+        }
+
+        /// Returns a const view with optional components represented by nullable const pointers.
+        /// Optional component types do not affect whether an entity matches.
+        template<typename... Components, typename... Optional>
+            requires view_component_types<Components..., Optional...>
+        auto view(optional_t<Optional...>) const
+        {
+            return view_impl(
+                *this, type_list<Components...>, include<>, exclude<>, optional<Optional...>);
+        }
+
+        /// Returns a mutable view with optional components represented by nullable pointers.
+        /// Optional component types do not affect whether an entity matches.
+        template<typename... Components, typename... Optional>
+            requires view_component_types<Components..., Optional...>
+        auto view(optional_t<Optional...>)
+        {
+            return view_impl(
+                *this, type_list<Components...>, include<>, exclude<>, optional<Optional...>);
+        }
+
+        /// Returns a mutable view with excluded filters and nullable optional components.
+        template<typename... Components, typename... Excluded, typename... Optional>
+            requires view_component_types<Components..., Optional...>
+        auto view(exclude_t<Excluded...>, optional_t<Optional...>)
+        {
+            return view_impl(*this,
+                             type_list<Components...>,
+                             include<>,
+                             exclude<Excluded...>,
+                             optional<Optional...>);
+        }
+
+        /// Returns a const view with excluded filters and nullable optional components.
+        template<typename... Components, typename... Excluded, typename... Optional>
+            requires view_component_types<Components..., Optional...>
+        auto view(exclude_t<Excluded...>, optional_t<Optional...>) const
+        {
+            return view_impl(*this,
+                             type_list<Components...>,
+                             include<>,
+                             exclude<Excluded...>,
+                             optional<Optional...>);
+        }
+
+        /// Returns a mutable view with required, included, excluded, and optional components.
+        template<typename... Components,
+                 typename... Included,
+                 typename... Excluded,
+                 typename... Optional>
+            requires view_component_types<Components..., Optional...>
+        auto view(include_t<Included...>, exclude_t<Excluded...>, optional_t<Optional...>)
+        {
+            return view_impl(*this,
+                             type_list<Components...>,
+                             include<Included...>,
+                             exclude<Excluded...>,
+                             optional<Optional...>);
+        }
+
+        /// Returns a const view with required, included, excluded, and optional components.
+        template<typename... Components,
+                 typename... Included,
+                 typename... Excluded,
+                 typename... Optional>
+            requires view_component_types<Components..., Optional...>
+        auto view(include_t<Included...>, exclude_t<Excluded...>, optional_t<Optional...>) const
+        {
+            return view_impl(*this,
+                             type_list<Components...>,
+                             include<Included...>,
+                             exclude<Excluded...>,
+                             optional<Optional...>);
         }
 
     private:
@@ -770,54 +686,81 @@ namespace snapfit
                 std::as_const(*this).template find_storage<Component>());
         }
 
-        template<typename... Components>
-        auto pools_with() const noexcept
-            -> std::optional<std::array<const storage_base<entity>*, sizeof...(Components)>>
-        {
-            std::array pools { static_cast<const storage_base<entity>*>(
-                find_storage<Components>())... };
-            if (std::ranges::find(pools, nullptr) != pools.end())
-            {
-                return std::nullopt;
-            }
-
-            return pools;
-        }
-
         template<typename Component>
-        [[nodiscard]]
-        bool has(entity ent) const noexcept
+        [[nodiscard]] bool has(entity ent) const noexcept
         {
             using component_no_cvref = std::remove_cvref_t<Component>;
             const auto* pool = find_storage<component_no_cvref>();
             return pool && pool->contains(ent);
         }
 
+        template<typename Component>
+        struct get_component {
+            using type = Component;
+        };
+
+        template<typename Component>
+        struct get_component<details::optional_component<Component>> {
+            using type = typename details::optional_component<Component>::type;
+        };
+
+        template<typename Component>
+        using get_component_t = typename get_component<Component>::type;
+
         template<typename Component, typename Self>
         static auto view_storage(Self& self) noexcept
         {
-            using component_type = std::remove_cvref_t<Component>;
+            using component_type = get_component_t<Component>;
             constexpr bool is_const =
-                std::is_const_v<Self> || std::is_const_v<std::remove_reference_t<Component>>;
+                std::is_const_v<Self> || std::is_const_v<std::remove_reference_t<component_type>>;
+            constexpr bool is_opt = details::is_optional_component<Component>::value;
+            using component_no_cvref = std::remove_cvref_t<component_type>;
 
             if constexpr (is_const)
             {
-                return static_cast<const storage<component_type, Traits>*>(
-                    self.template find_storage<component_type>());
+                const auto* pool = static_cast<const storage<component_no_cvref, Traits>*>(
+                    self.template find_storage<component_no_cvref>());
+                if constexpr (is_opt)
+                {
+                    return details::optional_storage<std::remove_pointer_t<decltype(pool)>> {
+                        .pool = pool
+                    };
+                }
+                else
+                {
+                    return pool;
+                }
             }
             else
             {
-                return self.template find_storage<component_type>();
+                auto* pool = self.template find_storage<component_no_cvref>();
+                if constexpr (is_opt)
+                {
+                    return details::optional_storage<std::remove_pointer_t<decltype(pool)>> {
+                        .pool = pool
+                    };
+                }
+                else
+                {
+                    return pool;
+                }
             }
         }
 
-        template<typename Self, typename... Components, typename... Included, typename... Excluded>
+        template<typename Self,
+                 typename... Components,
+                 typename... Included,
+                 typename... Excluded,
+                 typename... Optional>
         static auto view_impl(Self& self,
                               type_list_t<Components...>,
                               include_t<Included...>,
-                              exclude_t<Excluded...>)
+                              exclude_t<Excluded...>,
+                              optional_t<Optional...>)
         {
-            auto component_pools = std::tuple { view_storage<Components>(self)... };
+            auto component_pools =
+                std::tuple { view_storage<Components>(self)...,
+                             view_storage<details::optional_component<Optional>>(self)... };
 
             std::array<const storage_base<entity>*, sizeof...(Included)> included_pools {
                 self.template find_storage<std::remove_cvref_t<Included>>()...
