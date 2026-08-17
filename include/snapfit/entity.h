@@ -44,6 +44,7 @@ namespace snapfit
         typename std::integral_constant<typename Type::index_type, Type::max_index>;
         typename std::integral_constant<typename Type::generation_type, Type::max_generation>;
         typename std::integral_constant<typename Type::generation_type, Type::tombstone>;
+        typename std::integral_constant<std::size_t, Type::component_cache_size>;
         requires(Type::max_index < Type::null_index);
         requires(Type::max_generation < Type::tombstone);
         requires(is_one_of_v<typename Type::wrap_policy,
@@ -101,6 +102,7 @@ namespace snapfit
         static constexpr generation_type tombstone = bitmask<generation_type>(generation_bits) - 1;
         static constexpr generation_type max_generation =
             bitmask<generation_type>(generation_bits) - 2;
+        static constexpr std::size_t component_cache_size = 2;
     };
 
     /// Thrown when an entity does not own a requested component.

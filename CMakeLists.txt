@@ -7,6 +7,8 @@ project(
     LANGUAGES CXX
 )
 
+option(SNAPFIT_BUILD_BENCHMARKS "Build the snapfit benchmark suite" OFF)
+
 add_library(snapfit_lib INTERFACE)
 target_include_directories(snapfit_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(snapfit_lib INTERFACE cxx_std_23)
@@ -66,6 +68,24 @@ else()
                 -Wheader-hygiene
         )
     endif()
+endif()
+
+if(SNAPFIT_BUILD_BENCHMARKS)
+    include(FetchContent)
+
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        GoogleBenchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG v1.9.1
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(GoogleBenchmark)
+
+    add_executable(snapfit_benchmarks benchmarks/ecs_benchmarks.cpp)
+    target_link_libraries(snapfit_benchmarks PRIVATE snapfit_lib benchmark::benchmark_main)
 endif()
 
 include(CTest)

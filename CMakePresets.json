@@ -30,6 +30,16 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
+        },
+        {
+            "name": "benchmark",
+            "displayName": "Benchmarks",
+            "inherits": "release",
+            "binaryDir": "${sourceDir}/build/benchmark",
+            "cacheVariables": {
+                "BUILD_TESTING": false,
+                "SNAPFIT_BUILD_BENCHMARKS": true
+            }
         }
     ],
     "buildPresets": [
@@ -40,6 +50,13 @@
         {
             "name": "release",
             "configurePreset": "release"
+        },
+        {
+            "name": "benchmark",
+            "configurePreset": "benchmark",
+            "targets": [
+                "snapfit_benchmarks"
+            ]
         }
     ],
     "testPresets": [

@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -80,6 +81,7 @@ namespace snapfit
             const auto free_count = old_size - alive_count - retired_count;
             const auto fresh_count = requested > free_count ? requested - free_count : 0;
             entities.reserve(entities.size() + fresh_count);
+            entity_components.reserve(entity_components.size() + fresh_count);
 
             struct previous_head {
                 Traits::index_type index;
@@ -92,6 +94,7 @@ namespace snapfit
             auto rollback = [&]()
             {
                 entities.resize(old_size);
+                entity_components.resize(old_size);
 
                 std::for_each(
                     heads.rbegin(), heads.rend(), [&](const auto r) { entities[r.index] = r.ent; });
@@ -124,6 +127,7 @@ namespace snapfit
                 try
                 {
                     entities.reserve(remainder + entities.size());
+                    entity_components.reserve(remainder + entity_components.size());
 
                     while (first != last)
                     {
@@ -181,6 +185,16 @@ namespace snapfit
                 const auto old_size = static_cast<Traits::index_type>(entities.size());
                 entities.resize(static_cast<std::size_t>(index) + 1);
 
+                try
+                {
+                    entity_components.resize(static_cast<std::size_t>(index + 1));
+                }
+                catch (...)
+                {
+                    entities.resize(old_size);
+                    throw;
+                }
+
                 auto next = free_head;
 
                 for (auto ix = static_cast<std::size_t>(index); ix-- > old_size;)
@@ -237,6 +251,7 @@ namespace snapfit
 
             ++alive_count;
             entities[current] = hint;
+            entity_components[current] = component_membership {};
             return hint;
         }
 
@@ -254,8 +269,36 @@ namespace snapfit
 
             using component_no_cvref = std::remove_cvref_t<Component>;
 
-            return assure_storage<component_no_cvref>().emplace(ent,
-                                                                std::forward<Arguments>(args)...);
+            const auto id = details::id_of<component_no_cvref>();
+            auto& membership =
+                entity_components[static_cast<std::size_t>(details::entity_index<Traits>(ent))];
+            if (membership.inline_size == Traits::component_cache_size)
+            {
+                membership.overflow.push_back(id);
+            }
+            else
+            {
+                membership.inline_ids[membership.inline_size++] = id;
+            }
+
+            try
+            {
+                return assure_storage<component_no_cvref>().emplace(
+                    ent, std::forward<Arguments>(args)...);
+            }
+            catch (...)
+            {
+                if (!membership.overflow.empty())
+                {
+                    membership.overflow.pop_back();
+                }
+                else
+                {
+                    --membership.inline_size;
+                }
+
+                throw;
+            }
         }
 
         /// Returns a mutable component owned by a live entity.
@@ -286,7 +329,7 @@ namespace snapfit
             }
 
             using component_no_cvref = std::remove_cvref_t<Component>;
-            const auto* pool = find_storage<component_no_cvref>();
+            const auto* pool = try_find_storage<component_no_cvref>();
             if (!pool)
             {
                 throw no_such_component {};
@@ -315,7 +358,7 @@ namespace snapfit
             }
 
             using component_no_cvref = std::remove_cvref_t<Component>;
-            const auto* pool = find_storage<component_no_cvref>();
+            const auto* pool = try_find_storage<component_no_cvref>();
             if (!pool || !pool->contains(ent))
             {
                 return nullptr;
@@ -404,10 +447,47 @@ namespace snapfit
                 return false;
             }
 
+            auto& membership = entity_components[details::entity_index<Traits>(ent)];
+
             using component_no_cvref = std::remove_cvref_t<Component>;
-            if (auto* pool = find_storage<component_no_cvref>())
+
+            auto id = details::id_of<component_no_cvref>();
+
+            for (std::size_t ix = 0; ix < membership.inline_size; ++ix)
             {
-                return pool->erase(ent);
+                if (membership.inline_ids[ix] == id)
+                {
+                    const auto erase_result =
+                        storage_pools[id] ? storage_pools[id]->erase(ent) : false;
+
+                    std::size_t jx = ix;
+                    if (!membership.overflow.empty())
+                    {
+                        membership.inline_ids[jx] = membership.overflow.back();
+                        membership.overflow.pop_back();
+                    }
+                    else
+                    {
+                        for (; jx < membership.inline_size - 1; ++jx)
+                        {
+                            membership.inline_ids[jx] = membership.inline_ids[jx + 1];
+                        }
+                        --membership.inline_size;
+                    }
+
+                    return erase_result;
+                }
+            }
+
+            for (auto it = membership.overflow.begin(); it != membership.overflow.end(); ++it)
+            {
+                if (*it == id)
+                {
+                    const auto erase_result =
+                        storage_pools[id] ? storage_pools[id]->erase(ent) : false;
+                    membership.overflow.erase(it);
+                    return erase_result;
+                }
             }
 
             return false;
@@ -424,20 +504,75 @@ namespace snapfit
                 return;
             }
 
-            for (auto& pool : storage_pools)
+            erase(ent);
+        }
+
+        /// Releases every live entity in `[first, last)` and removes its components.
+        ///
+        /// The input range is copied before registry state is modified, so it may be
+        /// single-pass or backed by component storage that release invalidates. Stale handles
+        /// are ignored, and duplicate handles release an entity only once. Released handles
+        /// become invalid and their indices may be reused with newer generations.
+        template<std::input_iterator Iterator, std::sentinel_for<Iterator> Sentinel>
+            requires std::same_as<std::remove_cv_t<std::iter_value_t<Iterator>>, entity>
+        void release(Iterator first, Sentinel last)
+        {
+            std::vector<entity> pending {};
+
+            for (; first != last; ++first)
             {
-                if (pool)
+                const auto ent = *first;
+                if (valid(ent))
+                {
+                    pending.push_back(ent);
+                }
+            }
+
+            std::vector<std::vector<entity>> removals(storage_pools.size());
+
+            for (const auto ent : pending)
+            {
+                const auto index = details::entity_index<Traits>(ent);
+                const auto& membership = entity_components[index];
+                for (std::size_t ix = 0; ix < membership.inline_size; ++ix)
+                {
+                    const auto id = membership.inline_ids[ix];
+                    removals[id].push_back(ent);
+                }
+
+                for (const auto id : membership.overflow)
+                {
+                    removals[id].push_back(ent);
+                }
+            }
+
+            for (std::size_t id = 0; id < removals.size(); ++id)
+            {
+                auto* pool = storage_pools[id].get();
+                if (!pool)
+                {
+                    continue;
+                }
+
+                for (const auto ent : removals[id])
                 {
                     (void)pool->erase(ent);
                 }
             }
 
-            set_free(ent);
+            for (const auto ent : pending)
+            {
+                if (valid(ent))
+                {
+                    set_free(ent);
+                }
+            }
         }
 
         /// Returns a view yielding `Components...` for entities that satisfy the given filters.
-        /// Included types must be present and excluded types must be absent; filter components are
-        /// not returned. A mutable registry yields mutable references unless a component is const.
+        /// Included types must be present and excluded types must be absent; filter components
+        /// are not returned. A mutable registry yields mutable references unless a component is
+        /// const.
         template<typename... Components, typename... Included, typename... Excluded>
             requires view_component_types<Components...>
         auto view(include_t<Included...>, exclude_t<Excluded...>)
@@ -499,8 +634,8 @@ namespace snapfit
             return view_impl(*this, type_list<Components...>, include<>, exclude<>, optional<>);
         }
 
-        /// Returns a const view with optional components represented by nullable const pointers.
-        /// Optional component types do not affect whether an entity matches.
+        /// Returns a const view with optional components represented by nullable const
+        /// pointers. Optional component types do not affect whether an entity matches.
         template<typename... Components, typename... Optional>
             requires view_component_types<Components..., Optional...>
         auto view(optional_t<Optional...>) const
@@ -574,8 +709,29 @@ namespace snapfit
         }
 
     private:
+        template<auto V>
+        struct smallest_int_for_value {
+            using type = std::conditional_t<
+                (V <= 0xFF),
+                std::uint8_t,
+                std::conditional_t<
+                    (V <= 0xFFFF),
+                    std::uint16_t,
+                    std::conditional_t<(V <= 0xFFFFFFFF), std::uint32_t, std::uint64_t>>>;
+        };
+
+        template<auto V>
+        using smallest_int_for_value_t = typename smallest_int_for_value<V>::type;
+
+        struct component_membership {
+            std::array<details::type_id, Traits::component_cache_size> inline_ids {};
+            std::vector<details::type_id> overflow {};
+            smallest_int_for_value_t<Traits::component_cache_size> inline_size {};
+        };
+
         static constexpr auto gen_zero = static_cast<Traits::generation_type>(0);
         std::vector<entity> entities;
+        std::vector<component_membership> entity_components;
         Traits::index_type free_head = Traits::null_index;
         std::size_t alive_count {};
         std::size_t retired_count {};
@@ -588,6 +744,17 @@ namespace snapfit
             const auto value = details::make_entity<Traits>(index, gen_zero);
 
             entities.push_back(value);
+
+            try
+            {
+                entity_components.emplace_back();
+            }
+            catch (...)
+            {
+                entities.pop_back();
+                throw;
+            }
+
             ++alive_count;
 
             return value;
@@ -644,6 +811,7 @@ namespace snapfit
             const auto value = details::make_entity<Traits>(index, generation);
 
             entities[index] = value;
+            entity_components[index] = component_membership {};
             ++alive_count;
 
             return value;
@@ -667,7 +835,7 @@ namespace snapfit
         }
 
         template<typename Component>
-        const storage<Component, Traits>* find_storage() const noexcept
+        const storage<Component, Traits>* try_find_storage() const noexcept
         {
             const auto id = details::id_of<Component>();
 
@@ -680,18 +848,55 @@ namespace snapfit
         }
 
         template<typename Component>
-        storage<Component, Traits>* find_storage() noexcept
+        storage<Component, Traits>* try_find_storage() noexcept
         {
             return const_cast<storage<Component, Traits>*>(
-                std::as_const(*this).template find_storage<Component>());
+                std::as_const(*this).template try_find_storage<Component>());
         }
 
         template<typename Component>
         [[nodiscard]] bool has(entity ent) const noexcept
         {
             using component_no_cvref = std::remove_cvref_t<Component>;
-            const auto* pool = find_storage<component_no_cvref>();
+            const auto& membership =
+                entity_components[static_cast<std::size_t>(details::entity_index<Traits>(ent))];
+
+            auto id = details::id_of<component_no_cvref>();
+            for (std::size_t ix = 0; ix < membership.inline_size; ++ix)
+            {
+                if (membership.inline_ids[ix] == id)
+                {
+                    return true;
+                }
+            }
+
+            const auto* pool = try_find_storage<component_no_cvref>();
             return pool && pool->contains(ent);
+        }
+
+        void erase(entity ent)
+        {
+            auto erase_from = [&](auto& pool)
+            {
+                if (pool)
+                {
+                    pool->erase(ent);
+                }
+            };
+
+            auto& membership =
+                entity_components[static_cast<std::size_t>(details::entity_index<Traits>(ent))];
+            for (std::size_t ix = 0; ix < membership.inline_size; ++ix)
+            {
+                erase_from(storage_pools[membership.inline_ids[ix]]);
+            }
+
+            for (auto ix : membership.overflow)
+            {
+                erase_from(storage_pools[ix]);
+            }
+
+            set_free(ent);
         }
 
         template<typename Component>
@@ -719,7 +924,7 @@ namespace snapfit
             if constexpr (is_const)
             {
                 const auto* pool = static_cast<const storage<component_no_cvref, Traits>*>(
-                    self.template find_storage<component_no_cvref>());
+                    self.template try_find_storage<component_no_cvref>());
                 if constexpr (is_opt)
                 {
                     return details::optional_storage<std::remove_pointer_t<decltype(pool)>> {
@@ -733,7 +938,7 @@ namespace snapfit
             }
             else
             {
-                auto* pool = self.template find_storage<component_no_cvref>();
+                auto* pool = self.template try_find_storage<component_no_cvref>();
                 if constexpr (is_opt)
                 {
                     return details::optional_storage<std::remove_pointer_t<decltype(pool)>> {
@@ -763,11 +968,11 @@ namespace snapfit
                              view_storage<details::optional_component<Optional>>(self)... };
 
             std::array<const storage_base<entity>*, sizeof...(Included)> included_pools {
-                self.template find_storage<std::remove_cvref_t<Included>>()...
+                self.template try_find_storage<std::remove_cvref_t<Included>>()...
             };
 
             std::array<const storage_base<entity>*, sizeof...(Excluded)> excluded_pools {
-                self.template find_storage<std::remove_cvref_t<Excluded>>()...
+                self.template try_find_storage<std::remove_cvref_t<Excluded>>()...
             };
 
             if constexpr (sizeof...(Components) + sizeof...(Included) == 0)
@@ -801,8 +1006,8 @@ namespace snapfit
                 }
 
                 std::array<const storage_base<entity>*, sizeof...(Components) + sizeof...(Included)>
-                    pools { self.template find_storage<std::remove_cvref_t<Components>>()...,
-                            self.template find_storage<std::remove_cvref_t<Included>>()... };
+                    pools { self.template try_find_storage<std::remove_cvref_t<Components>>()...,
+                            self.template try_find_storage<std::remove_cvref_t<Included>>()... };
 
                 const auto smallest = std::ranges::min_element(
                     pools, {}, [](const auto* pool) { return pool->size(); });

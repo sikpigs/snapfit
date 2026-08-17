@@ -34,6 +34,48 @@
             "problemMatcher": []
         },
         {
+            "label": "CMake: configure registry tests",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build registry tests",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "debug",
+                "--target",
+                "snapfit_tests"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "CMake: configure registry tests",
+            "dependsOrder": "sequence",
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "CMake: run registry tests",
+            "type": "cmake",
+            "command": "test",
+            "preset": "debug",
+            "dependsOn": "CMake: build registry tests",
+            "dependsOrder": "sequence",
+            "problemMatcher": []
+        },
+        {
             "label": "CMake: build release",
             "type": "cmake",
             "command": "build",

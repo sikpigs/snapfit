@@ -5,6 +5,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -68,6 +69,10 @@ namespace
     concept tag_optional_viewable =
         requires(Registry& value) { value.template view<>(snapfit::optional<selected>); };
 
+    template<typename Registry, typename Iterator>
+    concept bulk_releasable =
+        requires(Registry& value, Iterator first, Iterator last) { value.release(first, last); };
+
     enum class tiny_entity : std::uint32_t
     {
     };
@@ -92,6 +97,7 @@ namespace
         static constexpr index_type max_index = 2;
         static constexpr generation_type tombstone = 3;
         static constexpr generation_type max_generation = 2;
+        static constexpr std::size_t component_cache_size = 2;
     };
 
     template<typename TinyTraits>
@@ -210,6 +216,88 @@ TEST_CASE("release invalidates stale handles and increments the generation")
     CHECK(replacement != stale);
     CHECK_FALSE(value.contains<position>(stale));
     CHECK_THROWS_AS(value.emplace<position>(stale, 20), snapfit::invalid_entity);
+}
+
+TEST_CASE("bulk release handles stale and duplicate entities without corrupting reuse")
+{
+    registry value;
+    const auto first = value.create();
+    const auto second = value.create();
+    const auto untouched = value.create();
+    const auto stale = value.create();
+
+    value.release(stale);
+    const auto replacement = value.create();
+    REQUIRE(index_of(replacement) == index_of(stale));
+
+    value.emplace<position>(first, 1);
+    value.emplace<velocity>(first, 2);
+    value.emplace<selected>(first);
+    value.emplace<position>(second, 3);
+    value.emplace<position>(untouched, 4);
+    value.emplace<position>(replacement, 5);
+
+    std::array pending { first, stale, second, first };
+    value.release(pending.begin(), pending.end());
+
+    CHECK_THROWS_AS(value.emplace<position>(first, 6), snapfit::invalid_entity);
+    CHECK_THROWS_AS(value.emplace<position>(second, 7), snapfit::invalid_entity);
+    CHECK(value.get<position>(untouched).x == 4);
+    CHECK(value.get<position>(replacement).x == 5);
+
+    const auto first_reused = value.create();
+    const auto second_reused = value.create();
+    CHECK(
+        (index_of(first_reused) == index_of(first) || index_of(first_reused) == index_of(second)));
+    CHECK((index_of(second_reused) == index_of(first)
+           || index_of(second_reused) == index_of(second)));
+    CHECK(index_of(first_reused) != index_of(second_reused));
+
+    CHECK_FALSE(value.contains<position>(first_reused));
+    CHECK_FALSE(value.contains<velocity>(first_reused));
+    CHECK_FALSE(value.contains<selected>(first_reused));
+    CHECK_FALSE(value.contains<position>(second_reused));
+
+    const auto next = value.create();
+    CHECK(index_of(next) != index_of(first));
+    CHECK(index_of(next) != index_of(second));
+
+    std::vector<entity> empty;
+    value.release(empty.begin(), empty.end());
+    CHECK(value.get<position>(untouched).x == 4);
+}
+
+TEST_CASE("bulk release snapshots a single-pass component-backed range")
+{
+    registry value;
+    const auto first = value.create();
+    const auto second = value.create();
+    const auto third = value.create();
+    const auto untouched = value.create();
+
+    for (const auto ent : { first, second, third })
+    {
+        value.emplace<position>(ent, 1);
+        value.emplace<velocity>(ent, 2);
+    }
+    value.emplace<velocity>(untouched, 3);
+
+    auto entities =
+        value.view<position>() | std::views::transform([](auto row) { return std::get<0>(row); });
+    static_assert(std::ranges::input_range<decltype(entities)>);
+
+    value.release(entities.begin(), entities.end());
+
+    CHECK_THROWS_AS(value.emplace<position>(first, 4), snapfit::invalid_entity);
+    CHECK_THROWS_AS(value.emplace<position>(second, 4), snapfit::invalid_entity);
+    CHECK_THROWS_AS(value.emplace<position>(third, 4), snapfit::invalid_entity);
+    CHECK(value.get<velocity>(untouched).x == 3);
+}
+
+TEST_CASE("bulk release accepts only entity iterators")
+{
+    static_assert(bulk_releasable<registry, std::vector<entity>::iterator>);
+    static_assert(!bulk_releasable<registry, std::vector<int>::iterator>);
 }
 
 TEST_CASE("component operations follow entity lifetime")
